@@ -7,7 +7,10 @@
       "mcp__claude_ai_Datadog__search_datadog_spans",
       "mcp__claude_ai_Datadog__get_datadog_trace",
       "mcp__claude_ai_Slack__slack_search_channels",
-      "mcp__claude_ai_Slack__slack_send_message"
+      "mcp__claude_ai_Slack__slack_send_message",
+      "Bash(bin/cadb query:*)",
+      "Bash(bin/cadb list)",
+      "Bash(bin/cadb status)"
     ]
   }
 }
