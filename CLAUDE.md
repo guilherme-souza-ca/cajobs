@@ -19,7 +19,15 @@ Projeto local de agents do Claude Code para automações de observabilidade (Dat
 
 | Skill | Uso | O que faz |
 |---|---|---|
+| `consultar-database` | `/consultar-database hml order-to-cash-commercial <pergunta ou SQL>` | Consulta PostgreSQL **somente leitura** via `bin/cadb query` com credenciais do Vault cacheadas (~24h). |
 | `enviar-report-slack` | `/enviar-report-slack erros-5xx-otc #meu-canal` | Envia um relatório de `reports/` (mais recente da automação, de uma data, ou caminho) para um canal/DM do Slack: só o título (`--titulo`, aceita `{data}`) no canal e o conteúdo na thread, dividido em partes se passar de 5.000 caracteres. `--preview` só mostra. |
+
+## Bases de dados (`bin/cadb`)
+
+- Catálogo de hosts em `~/.config/cajobs/databases.json` (nunca no repo — o repo é público); modelo em `config/databases.example.json`.
+- Credenciais: `cadb` reaproveita a credencial do Vault até 10 min antes de expirar; validade em `~/.config/cajobs/db-cache.json`, senha no Keychain.
+- O Claude só pode usar `cadb query|list|status`. Nunca `cadb login`, `cadb psql`, `--writer`, `vault`, `psql` ou `security` diretamente; nunca exibir senhas/tokens.
+- Sem login no Vault → instruir o usuário a rodar `cadb login <env>`.
 
 ## Convenções
 

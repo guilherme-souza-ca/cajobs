@@ -46,6 +46,8 @@ cajobs enable erros-5xx-otc
 ```
 agents/
 ├── bin/cajobs                          # CLI orquestradora (bash + jq + launchd)
+├── bin/cadb                            # acesso a bancos via Vault com cache de credenciais
+├── config/databases.example.json       # modelo do catálogo de hosts
 ├── automations/                        # definições das automações (JSON)
 │   └── erros-5xx-otc.json
 ├── .claude/
@@ -55,7 +57,8 @@ agents/
 │   │   ├── erros-5xx.md
 │   │   └── enviar-5xx-slack.md
 │   ├── skills/
-│   │   └── enviar-report-slack/SKILL.md
+│   │   ├── enviar-report-slack/SKILL.md
+│   │   └── consultar-database/SKILL.md
 │   └── settings.json                   # permissões pré-aprovadas (headless)
 ├── reports/<automação>/*.md            # relatórios gerados   (não versionado)
 ├── logs/                               # logs e history.tsv   (não versionado)
@@ -152,6 +155,52 @@ Para publicar no Slack, crie um command como `enviar-5xx-slack.md` apontando par
 - **Histórico**: `logs/history.tsv` (`inicio`, `automacao`, `rc`, `status`, `relatorio`) — automações e commands.
 - **Logs**: `logs/<automação>.log` (execução e `after`), `logs/<automação>.launchd.log` (saída do launchd), `logs/commands.log` (`cajobs command`).
 
+## Bases de dados (`cadb` + skill `consultar-database`)
+
+Acesso a bases PostgreSQL dos serviços com credenciais dinâmicas do Vault (`database/creds/<svc>-datareader|datawriter`). Cada credencial é **reaproveitada enquanto válida** (TTL do Vault, ~24h, renovando 10 min antes) — sem pedir usuário/senha novos a cada conexão.
+
+### Onde ficam os dados
+
+| Item | Local |
+|---|---|
+| Catálogo de hosts | `~/.config/cajobs/databases.json` (fora do repo, `chmod 600`) — modelo em `config/databases.example.json` |
+| Validade das credenciais | `~/.config/cajobs/db-cache.json` (usuário, lease, obtida/expira — **sem senha**) |
+| Senhas, tokens do Vault e GitHub token | macOS Keychain (`cajobs-db`, `cajobs-vault`, `cajobs-github`) |
+
+### Setup (uma vez)
+
+```bash
+ln -s ~/repos/local/agents/bin/cadb ~/.local/bin/cadb
+cadb init                                                   # cria o catálogo; preencha host/port/dbname
+security add-generic-password -s cajobs-github -a github -w # GitHub token (prompt oculto)
+cadb login prod && cadb login hml                           # um token do Vault por ambiente
+```
+
+Se você já fez login com `login-vault-prod|hml`, a `cadb` reaproveita o `~/.vault-token` quando ele vale para o ambiente.
+
+### CLI `cadb`
+
+| Comando | O que faz |
+|---|---|
+| `cadb list` | serviços do catálogo por ambiente |
+| `cadb login <env>` | login no Vault do ambiente |
+| `cadb creds <env> <svc> [--writer] [--refresh]` | garante credencial válida (cache ou Vault); mostra usuário e validade, nunca a senha |
+| `cadb status` | credenciais em cache: obtida em, expira em, tempo restante |
+| `cadb query <env> <svc> "<sql>"` | SQL **somente leitura** (reader), saída CSV |
+| `cadb psql <env> <svc> [--writer]` | `psql` interativo; `--writer` pede confirmação digitando o nome do serviço |
+| `cadb forget <env> <svc>` / `--all` | apaga do cache/Keychain e revoga o lease |
+
+Proteções do `cadb query`: só `datareader`; transação `read_only`; `statement_timeout` de 60s; um comando por vez; bloqueia `INSERT/UPDATE/DELETE/DDL/COPY…`; aplica `LIMIT 200` quando não há `LIMIT`. Se o banco recusar a credencial (lease revogado), renova uma vez automaticamente. Log com metadados apenas em `logs/cadb.log`.
+
+### Skill
+
+```
+/consultar-database hml order-to-cash-commercial quantas tabelas de preço ativas existem?
+/consultar-database prod order-to-cash-commercial SELECT count(*) FROM price_table
+```
+
+O Claude só usa `cadb query|list|status` (liberados no `settings.json`), sempre como reader; em prod confirma o SQL antes de executar numa sessão interativa; mascara dados pessoais na resposta.
+
 ## Limitações e troubleshooting
 
 | Situação | O que acontece / o que fazer |
@@ -163,10 +212,13 @@ Para publicar no Slack, crie um command como `enviar-5xx-slack.md` apontando par
 | Erro de autenticação Datadog/Slack | reconecte o conector com `/mcp` numa sessão interativa |
 | `já está em execução (lock …)` | outra execução em andamento; se um processo morreu à força, apague `.locks/<nome>` |
 | `cajobs: command not found` | confira o link em `~/.local/bin/cajobs` |
+| `cadb: sem login válido no Vault de '<env>'` | `cadb login <env>` (VPN ligada) |
+| `cadb: host … não preenchido` | complete `~/.config/cajobs/databases.json` |
 | Testar o agendamento sem esperar | `launchctl kickstart -k gui/$(id -u)/com.local.agents.<nome>` |
 
 ## Segurança
 
 - Agents são **somente leitura** no Datadog; ferramentas de escrita do Datadog não entram no `allow`.
+- Bancos: o Claude só executa `cadb query` (reader, transação somente leitura); hosts e credenciais ficam fora do repo (catálogo em `~/.config/cajobs/`, segredos no Keychain). `cadb login`, `psql` e `--writer` não são liberados para o Claude.
 - A única escrita liberada é o envio de mensagem no Slack, usada apenas pela skill `enviar-report-slack`, que recusa arquivos fora de `reports/` e para se encontrar segredos no conteúdo.
 - Mensagens de erro nos relatórios são truncadas e têm tokens, e-mails, CPF/CNPJ e IDs de tenant mascarados.
