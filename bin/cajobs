@@ -1,0 +1,357 @@
+#!/bin/bash
+# cajobs — orquestrador local de automações do Claude Code (claude -p + launchd).
+# Definições em automations/<nome>.json; relatórios em reports/<nome>/; logs em logs/.
+set -u
+
+# resolve symlinks (ex.: ~/.local/bin/cajobs -> bin/cajobs) para achar a raiz do projeto
+SELF="$0"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in /*) SELF="$target" ;; *) SELF="$(dirname "$SELF")/$target" ;; esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+AUTOMATIONS="$ROOT/automations"
+REPORTS="$ROOT/reports"
+LOGS="$ROOT/logs"
+LOCKS="$ROOT/.locks"
+HISTORY="$LOGS/history.tsv"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+LABEL_PREFIX="com.local.agents"
+GUI_DOMAIN="gui/$(id -u)"
+LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+die() { echo "cajobs: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+uso: cajobs <comando> [args]
+
+  list                      lista automações, agenda, estado no launchd e última execução
+  run <nome> [args...]      executa agora (args extras são anexados ao prompt)
+  enable <nome>             agenda no launchd conforme o "schedule" da definição
+  disable <nome>            remove o agendamento do launchd
+  status [nome]             estado do job no launchd
+  logs <nome> [linhas]      últimas linhas dos logs da automação
+  last <nome>               mostra o último relatório
+  new <nome>                cria automations/<nome>.json a partir do template
+  command <nome> [args...]  executa o slash command .claude/commands/<nome>.md (ex.: --preview)
+  commands                  lista os slash commands disponíveis
+EOF
+}
+
+require_jq() { command -v jq >/dev/null 2>&1 || die "jq não encontrado"; }
+
+def_path() {
+  local name="$1"
+  [ -n "$name" ] || die "informe o nome da automação"
+  local f="$AUTOMATIONS/$name.json"
+  [ -f "$f" ] || die "automação '$name' não existe ($f)"
+  jq empty "$f" 2>/dev/null || die "JSON inválido em $f"
+  echo "$f"
+}
+
+label_of() { echo "$LABEL_PREFIX.$1"; }
+plist_of() { echo "$LAUNCH_AGENTS/$(label_of "$1").plist"; }
+
+is_loaded() { launchctl print "$GUI_DOMAIN/$(label_of "$1")" >/dev/null 2>&1; }
+
+weekday_name() {
+  case "$1" in
+    0|7) echo dom ;; 1) echo seg ;; 2) echo ter ;; 3) echo qua ;;
+    4) echo qui ;; 5) echo sex ;; 6) echo sab ;; *) echo "?$1" ;;
+  esac
+}
+
+schedule_human() {
+  local f="$1"
+  if [ "$(jq -r 'has("schedule")' "$f")" != "true" ]; then echo "manual"; return; fi
+  local hm days d out=""
+  hm=$(jq -r '.schedule | "\(.hour // 0 | tostring | if length<2 then "0"+. else . end):\(.minute // 0 | tostring | if length<2 then "0"+. else . end)"' "$f")
+  days=$(jq -r '.schedule.weekdays // [] | .[]' "$f")
+  if [ -z "$days" ]; then echo "diário $hm"; return; fi
+  case "$(echo $days)" in
+    "1 2 3 4 5") echo "seg-sex $hm"; return ;;
+    "0 1 2 3 4 5 6"|"1 2 3 4 5 6 7") echo "diário $hm"; return ;;
+  esac
+  for d in $days; do out="$out$(weekday_name "$d"),"; done
+  echo "${out%,} $hm"
+}
+
+last_run() {
+  [ -f "$HISTORY" ] || { echo "—"; return; }
+  awk -F'\t' -v n="$1" '$2==n {line=$1" "$4} END {print (line=="" ? "—" : line)}' "$HISTORY"
+}
+
+cmd_list() {
+  require_jq
+  local f name
+  # cabeçalho sem acentos: printf do bash conta bytes, não caracteres
+  printf '%-24s %-22s %-8s %-26s %s\n' "AUTOMACAO" "AGENDA" "LAUNCHD" "ULTIMA EXECUCAO" "DESCRICAO"
+  for f in "$AUTOMATIONS"/*.json; do
+    [ -e "$f" ] || { echo "(nenhuma automação em $AUTOMATIONS)"; return; }
+    name="$(basename "$f" .json)"
+    local state="off"
+    is_loaded "$name" && state="on"
+    printf '%-24s %-22s %-8s %-26s %s\n' "$name" "$(schedule_human "$f")" "$state" \
+      "$(last_run "$name")" "$(jq -r '.description // ""' "$f")"
+  done
+}
+
+cmd_run() {
+  require_jq
+  local name="${1:-}"; shift || true
+  local f; f="$(def_path "$name")" || exit 1
+  local prompt model timeout_min
+  prompt="$(jq -r '.prompt // empty' "$f")"
+  [ -n "$prompt" ] || die "'$name' não tem \"prompt\""
+  [ $# -gt 0 ] && prompt="$prompt $*"
+  model="$(jq -r '.model // "sonnet"' "$f")"
+  timeout_min="$(jq -r '.timeout_minutes // 15' "$f")"
+
+  mkdir -p "$REPORTS/$name" "$LOGS" "$LOCKS"
+  local lock="$LOCKS/$name"
+  mkdir "$lock" 2>/dev/null || die "'$name' já está em execução (lock: $lock)"
+  trap 'rmdir "'"$lock"'" 2>/dev/null' EXIT
+  trap 'exit 130' INT TERM
+
+  local start_iso start_ts report out log rc status
+  start_iso="$(date '+%Y-%m-%d %H:%M:%S')"
+  start_ts="$(date '+%Y-%m-%d_%H%M%S')"
+  report="$REPORTS/$name/$start_ts.md"
+  log="$LOGS/$name.log"
+  out="$(mktemp)"
+
+  echo "[$start_iso] início: $name — prompt: $prompt (model=$model, timeout=${timeout_min}min)" >>"$log"
+  echo "▶ $name: executando (timeout ${timeout_min}min)…" >&2
+
+  cd "$ROOT" || die "não consegui entrar em $ROOT"
+  # perl alarm: timeout portátil (macOS não tem `timeout`); SIGALRM => rc 142
+  perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$((timeout_min * 60))" \
+    claude -p "$prompt" --model "$model" --output-format text </dev/null >"$out" 2>>"$log"
+  rc=$?
+
+  case "$rc" in
+    0) status="OK" ;;
+    142) status="FALHOU (timeout de ${timeout_min}min)" ;;
+    *) status="FALHOU (exit $rc)" ;;
+  esac
+
+  {
+    echo "<!--"
+    echo "automação: $name"
+    echo "prompt:    $prompt"
+    echo "modelo:    $model"
+    echo "início:    $start_iso"
+    echo "fim:       $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "status:    $status"
+    echo "-->"
+    echo
+    [ "$rc" -ne 0 ] && { echo "> **$status** — veja \`logs/$name.log\`"; echo; }
+    cat "$out"
+  } >"$report"
+  rm -f "$out"
+
+  [ -f "$HISTORY" ] || printf 'inicio\tautomacao\trc\tstatus\trelatorio\n' >"$HISTORY"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$start_iso" "$name" "$rc" "$status" "$report" >>"$HISTORY"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] fim: $name — $status — $report" >>"$log"
+
+  echo "$status → $report" >&2
+
+  # pós-execução: slash commands em "after" (ex.: enviar o relatório ao Slack).
+  # Rodam mesmo se a execução falhou — o relatório marcado FALHOU também precisa ser avisado.
+  local after_rc=0 c
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] after: /$c" >>"$log"
+    # subshell: cmd_command faz cd e return próprios; word-split proposital (nome + args)
+    # shellcheck disable=SC2086
+    if ( cmd_command $c ); then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] after OK: /$c" >>"$log"
+    else
+      after_rc=1
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] after FALHOU: /$c (veja logs/commands.log)" >>"$log"
+    fi
+  done <<EOF_AFTER
+$(jq -r '.after // [] | .[]' "$f")
+EOF_AFTER
+
+  [ "$rc" -ne 0 ] && return "$rc"
+  return "$after_rc"
+}
+
+calendar_xml() {
+  local f="$1" hour minute days d
+  hour="$(jq -r '.schedule.hour // 0' "$f")"
+  minute="$(jq -r '.schedule.minute // 0' "$f")"
+  days="$(jq -r '.schedule.weekdays // [] | .[]' "$f")"
+  echo "  <key>StartCalendarInterval</key>"
+  echo "  <array>"
+  if [ -z "$days" ]; then
+    echo "    <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>"
+  else
+    for d in $days; do
+      echo "    <dict><key>Weekday</key><integer>$d</integer><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$minute</integer></dict>"
+    done
+  fi
+  echo "  </array>"
+}
+
+cmd_enable() {
+  require_jq
+  local name="${1:-}" f
+  f="$(def_path "$name")" || exit 1
+  [ "$(jq -r 'has("schedule")' "$f")" = "true" ] || die "'$name' não tem \"schedule\" (é só manual)"
+  mkdir -p "$LAUNCH_AGENTS" "$LOGS"
+  local label plist
+  label="$(label_of "$name")"
+  plist="$(plist_of "$name")"
+
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$ROOT/bin/cajobs</string>
+    <string>run</string>
+    <string>$name</string>
+  </array>
+  <key>WorkingDirectory</key><string>$ROOT</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$LAUNCHD_PATH</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>LANG</key><string>pt_BR.UTF-8</string>
+  </dict>
+$(calendar_xml "$f")
+  <key>StandardOutPath</key><string>$LOGS/$name.launchd.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/$name.launchd.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$plist" >/dev/null || die "plist inválido: $plist"
+  launchctl bootout "$GUI_DOMAIN/$label" 2>/dev/null || true
+  launchctl bootstrap "$GUI_DOMAIN" "$plist" || die "falha no launchctl bootstrap"
+  echo "✔ $name agendado ($(schedule_human "$f")) — $plist"
+}
+
+cmd_disable() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "informe o nome da automação"
+  launchctl bootout "$GUI_DOMAIN/$(label_of "$name")" 2>/dev/null || true
+  rm -f "$(plist_of "$name")"
+  echo "✔ $name removido do launchd"
+}
+
+cmd_status() {
+  local names name
+  if [ -n "${1:-}" ]; then names="$1"; else
+    names="$(for f in "$AUTOMATIONS"/*.json; do [ -e "$f" ] && basename "$f" .json; done)"
+  fi
+  for name in $names; do
+    if is_loaded "$name"; then
+      echo "● $name (carregado)"
+      launchctl print "$GUI_DOMAIN/$(label_of "$name")" \
+        | grep -E '^[[:space:]]*(state|runs|last exit code|last terminating signal) =' \
+        | sed 's/^[[:space:]]*/    /'
+    else
+      echo "○ $name (não agendado)"
+    fi
+  done
+}
+
+cmd_logs() {
+  local name="${1:-}" n="${2:-50}"
+  [ -n "$name" ] || die "informe o nome da automação"
+  local f
+  for f in "$LOGS/$name.log" "$LOGS/$name.launchd.log"; do
+    [ -f "$f" ] && { echo "==> $f <=="; tail -n "$n" "$f"; echo; }
+  done
+}
+
+cmd_last() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "informe o nome da automação"
+  local latest
+  latest="$(ls -1t "$REPORTS/$name"/*.md 2>/dev/null | head -1)"
+  [ -n "$latest" ] || die "nenhum relatório para '$name'"
+  echo "==> $latest <==" >&2
+  cat "$latest"
+}
+
+cmd_new() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "informe o nome da automação"
+  case "$name" in *[!a-z0-9-]*) die "use só [a-z0-9-] no nome" ;; esac
+  local f="$AUTOMATIONS/$name.json"
+  [ -e "$f" ] && die "$f já existe"
+  mkdir -p "$AUTOMATIONS"
+  cat >"$f" <<'EOF'
+{
+  "description": "O que esta automação faz",
+  "prompt": "/meu-command argumento",
+  "model": "sonnet",
+  "timeout_minutes": 15,
+  "schedule": { "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5] }
+}
+EOF
+  echo "✔ criado $f — edite o prompt/schedule e rode: cajobs run $name"
+}
+
+COMMANDS="$ROOT/.claude/commands"
+
+cmd_commands() {
+  local f name desc
+  printf '%-24s %s\n' "COMANDO" "DESCRICAO"
+  for f in "$COMMANDS"/*.md; do
+    [ -e "$f" ] || { echo "(nenhum command em $COMMANDS)"; return; }
+    name="$(basename "$f" .md)"
+    desc="$(awk '/^---/{n++; next} n==1 && /^description:/{sub(/^description:[ ]*/, ""); print; exit}' "$f")"
+    printf '%-24s %s\n' "$name" "$desc"
+  done
+}
+
+# Executa um slash command do projeto em modo headless; saída vai para o terminal.
+cmd_command() {
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || { echo "uso: cajobs command <nome> [args...]" >&2; cmd_commands >&2; exit 1; }
+  name="${name#/}"
+  [ -f "$COMMANDS/$name.md" ] || { echo "cajobs: command '/$name' não existe" >&2; cmd_commands >&2; exit 1; }
+
+  local prompt="/$name" model="${CAJOBS_MODEL:-sonnet}" log="$LOGS/commands.log" start_iso rc status
+  [ $# -gt 0 ] && prompt="$prompt $*"
+  mkdir -p "$LOGS"
+  start_iso="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[$start_iso] início: $prompt (model=$model)" >>"$log"
+  echo "▶ $prompt" >&2
+
+  cd "$ROOT" || die "não consegui entrar em $ROOT"
+  claude -p "$prompt" --model "$model" --output-format text </dev/null 2>>"$log"
+  rc=$?
+
+  if [ "$rc" -eq 0 ]; then status="OK"; else status="FALHOU (exit $rc)"; fi
+  [ -f "$HISTORY" ] || printf 'inicio\tautomacao\trc\tstatus\trelatorio\n' >"$HISTORY"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$start_iso" "/$name" "$rc" "$status" "-" >>"$HISTORY"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] fim: $prompt — $status" >>"$log"
+  [ "$rc" -eq 0 ] || echo "$status — veja logs/commands.log" >&2
+  return "$rc"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list|ls)      cmd_list "$@" ;;
+  run)          cmd_run "$@" ;;
+  enable)       cmd_enable "$@" ;;
+  disable)      cmd_disable "$@" ;;
+  status)       cmd_status "$@" ;;
+  logs)         cmd_logs "$@" ;;
+  last)         cmd_last "$@" ;;
+  new)          cmd_new "$@" ;;
+  command|cmd)  cmd_command "$@" ;;
+  commands)     cmd_commands "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *)            usage; exit 1 ;;
+esac

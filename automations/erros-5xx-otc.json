@@ -1,0 +1,10 @@
+{
+  "description": "5xx + status:error do order-to-cash-commercial nas últimas 24h (production)",
+  "prompt": "/erros-5xx production",
+  "model": "sonnet",
+  "timeout_minutes": 15,
+  "schedule": { "hour": 10, "minute": 0, "weekdays": [1, 2, 3, 4, 5] },
+  "after": [
+    "enviar-5xx-slack"
+  ]
+}
