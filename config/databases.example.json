@@ -1,0 +1,24 @@
+{
+  "prod": {
+    "vault_addr": "https://<vault-de-prod>",
+    "databases": {
+      "order-to-cash-commercial": {
+        "host": "<host-do-banco>",
+        "port": 5432,
+        "dbname": "<nome-do-database>",
+        "sslmode": "require"
+      }
+    }
+  },
+  "hml": {
+    "vault_addr": "https://<vault-de-hml>",
+    "databases": {
+      "order-to-cash-commercial": {
+        "host": "<host-do-banco>",
+        "port": 5432,
+        "dbname": "<nome-do-database>",
+        "sslmode": "require"
+      }
+    }
+  }
+}

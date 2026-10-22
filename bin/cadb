@@ -1,0 +1,380 @@
+#!/bin/bash
+# cadb — acesso a bases PostgreSQL com credenciais dinâmicas do Vault, cacheadas até expirar.
+# Catálogo de hosts: ~/.config/cajobs/databases.json · metadados do cache: ~/.config/cajobs/db-cache.json
+# Segredos (senhas, tokens do Vault, GitHub token) ficam só no macOS Keychain.
+set -u
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in /*) SELF="$target" ;; *) SELF="$(dirname "$SELF")/$target" ;; esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+
+CFG_DIR="${CADB_CONFIG_DIR:-$HOME/.config/cajobs}"
+CATALOG="$CFG_DIR/databases.json"
+CACHE="$CFG_DIR/db-cache.json"
+EXAMPLE="$ROOT/config/databases.example.json"
+LOG="$ROOT/logs/cadb.log"
+
+KC_DB="cajobs-db"          # conta: <env>/<svc>/<role>
+KC_VAULT="cajobs-vault"    # conta: <env>
+KC_GITHUB="cajobs-github"  # conta: github
+
+MARGIN_SECONDS=600         # renova 10 min antes de expirar
+DEFAULT_TTL=86400          # fallback se o Vault não informar lease_duration
+QUERY_ROW_LIMIT=200
+STATEMENT_TIMEOUT="60s"
+
+export PATH="/opt/homebrew/opt/libpq/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+die() { echo "cadb: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+now() { date +%s; }
+fmt_ts() { date -r "$1" '+%d/%m/%Y %H:%M'; }
+
+log() {
+  mkdir -p "$(dirname "$LOG")"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >>"$LOG"
+}
+
+usage() {
+  cat <<'EOF'
+uso: cadb <comando> [args]
+
+  init                              cria ~/.config/cajobs/databases.json a partir do exemplo
+  list                              serviços do catálogo por ambiente
+  login <env>                       login no Vault do ambiente (GitHub token do Keychain ou $GITHUB_TOKEN)
+  creds <env> <svc> [--writer] [--refresh]
+                                    garante credencial válida (cache ou Vault); nunca mostra a senha
+  status                            credenciais em cache e validade
+  query <env> <svc> "<sql>"         executa SQL somente leitura (datareader) e devolve CSV
+  psql <env> <svc> [--writer]       sessão psql interativa
+  forget <env> <svc> | --all        apaga credenciais do cache/Keychain e revoga o lease
+
+ambientes: os definidos no catálogo (ex.: prod, hml)
+EOF
+}
+
+# ---------- Keychain ----------
+kc_get() { security find-generic-password -s "$1" -a "$2" -w 2>/dev/null; }
+
+# usa `security -i` (comandos via stdin) para o segredo não aparecer na lista de processos
+kc_set() {
+  local secret="${3//\\/\\\\}"
+  secret="${secret//\"/\\\"}"
+  printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' "$1" "$2" "$secret" \
+    | security -i >/dev/null 2>&1 || die "falha ao gravar no Keychain ($1/$2)"
+}
+
+kc_del() { security delete-generic-password -s "$1" -a "$2" >/dev/null 2>&1 || true; }
+
+# ---------- catálogo ----------
+require_catalog() {
+  command -v jq >/dev/null 2>&1 || die "jq não encontrado"
+  [ -f "$CATALOG" ] || die "catálogo não encontrado: $CATALOG — rode: cadb init"
+  jq empty "$CATALOG" 2>/dev/null || die "JSON inválido em $CATALOG"
+}
+
+vault_addr_of() {
+  local addr
+  addr="$(jq -r --arg e "$1" '.[$e].vault_addr // empty' "$CATALOG")"
+  [ -n "$addr" ] || die "ambiente '$1' não existe no catálogo (veja: cadb list)"
+  echo "$addr"
+}
+
+db_field() { jq -r --arg e "$1" --arg s "$2" --arg f "$3" '.[$e].databases[$s][$f] // empty' "$CATALOG"; }
+
+require_db() {
+  local env="$1" svc="$2"
+  vault_addr_of "$env" >/dev/null
+  [ "$(jq -r --arg e "$env" --arg s "$svc" '.[$e].databases | has($s)' "$CATALOG")" = "true" ] \
+    || die "serviço '$svc' não está no catálogo de '$env' (veja: cadb list)"
+  local host
+  host="$(db_field "$env" "$svc" host)"
+  case "$host" in ""|"<"*) die "host de '$svc' em '$env' não preenchido em $CATALOG" ;; esac
+}
+
+vault_role_of() {
+  local env="$1" svc="$2" role="$3" custom
+  custom="$(jq -r --arg e "$env" --arg s "$svc" --arg r "$role" '.[$e].databases[$s].vault_role[$r] // empty' "$CATALOG")"
+  if [ -n "$custom" ]; then echo "$custom"; else echo "$svc-data$role"; fi
+}
+
+# ---------- Vault ----------
+vault_token_valid() {
+  VAULT_ADDR="$1" VAULT_TOKEN="$2" vault token lookup -format=json >/dev/null 2>&1
+}
+
+# token do Vault do ambiente: Keychain; senão tenta ~/.vault-token (login feito pelas funções do zsh)
+vault_token_for() {
+  local env="$1" addr token
+  addr="$(vault_addr_of "$env")"
+  token="$(kc_get "$KC_VAULT" "$env")"
+  if [ -n "$token" ] && vault_token_valid "$addr" "$token"; then echo "$token"; return 0; fi
+  if [ -f "$HOME/.vault-token" ]; then
+    token="$(cat "$HOME/.vault-token")"
+    if [ -n "$token" ] && vault_token_valid "$addr" "$token"; then
+      kc_set "$KC_VAULT" "$env" "$token"
+      echo "$token"; return 0
+    fi
+  fi
+  return 1
+}
+
+cmd_login() {
+  require_catalog
+  local env="${1:-}"
+  [ -n "$env" ] || die "uso: cadb login <env>"
+  local addr gh resp token
+  addr="$(vault_addr_of "$env")"
+  gh="$(kc_get "$KC_GITHUB" github)"
+  [ -n "$gh" ] || gh="${GITHUB_TOKEN:-}"
+  [ -n "$gh" ] || die "GitHub token não encontrado. Guarde no Keychain: security add-generic-password -s $KC_GITHUB -a github -w"
+  # corpo via stdin: o token não vai para a linha de comando
+  resp="$(jq -n --arg t "$gh" '{token: $t}' | curl -sS --fail -X POST --data @- "$addr/v1/auth/github/login")" \
+    || die "falha no login do Vault em $addr"
+  token="$(echo "$resp" | jq -r '.auth.client_token // empty')"
+  [ -n "$token" ] || die "o Vault não devolveu token"
+  kc_set "$KC_VAULT" "$env" "$token"
+  local ttl
+  ttl="$(echo "$resp" | jq -r '.auth.lease_duration // 0')"
+  log "login env=$env ttl=${ttl}s"
+  info "✔ login no Vault de '$env' ok (token válido por $((ttl / 3600))h)"
+}
+
+# ---------- cache ----------
+cache_read() { [ -f "$CACHE" ] && jq -r --arg k "$1" --arg f "$2" '.[$k][$f] // empty' "$CACHE"; }
+
+cache_write() {
+  local key="$1" user="$2" lease="$3" fetched="$4" expires="$5" tmp
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  [ -f "$CACHE" ] || echo '{}' >"$CACHE"
+  tmp="$(mktemp)"
+  jq --arg k "$key" --arg u "$user" --arg l "$lease" --argjson f "$fetched" --argjson e "$expires" \
+    '.[$k] = {username: $u, lease_id: $l, fetched_at: $f, expires_at: $e}' "$CACHE" >"$tmp" && mv "$tmp" "$CACHE"
+  chmod 600 "$CACHE"
+}
+
+cache_delete() {
+  [ -f "$CACHE" ] || return 0
+  local tmp; tmp="$(mktemp)"
+  jq --arg k "$1" 'del(.[$k])' "$CACHE" >"$tmp" && mv "$tmp" "$CACHE"
+  chmod 600 "$CACHE"
+}
+
+# garante credencial válida; imprime a chave do cache em stdout
+ensure_creds() {
+  local env="$1" svc="$2" role="$3" refresh="${4:-0}"
+  local key="$env/$svc/$role" expires
+  expires="$(cache_read "$key" expires_at)"
+  if [ "$refresh" != "1" ] && [ -n "$expires" ] && [ "$(now)" -lt "$((expires - MARGIN_SECONDS))" ] \
+     && [ -n "$(kc_get "$KC_DB" "$key")" ]; then
+    log "creds cache env=$env svc=$svc role=$role"
+    echo "$key"; return 0
+  fi
+
+  local addr token vrole resp user pass lease ttl fetched
+  addr="$(vault_addr_of "$env")"
+  token="$(vault_token_for "$env")" || die "sem login válido no Vault de '$env' — rode: cadb login $env"
+  vrole="$(vault_role_of "$env" "$svc" "$role")"
+  resp="$(VAULT_ADDR="$addr" VAULT_TOKEN="$token" vault read -format=json "database/creds/$vrole" 2>/dev/null)" \
+    || die "falha ao ler database/creds/$vrole no Vault de '$env'"
+  user="$(echo "$resp" | jq -r '.data.username // empty')"
+  pass="$(echo "$resp" | jq -r '.data.password // empty')"
+  lease="$(echo "$resp" | jq -r '.lease_id // empty')"
+  ttl="$(echo "$resp" | jq -r '.lease_duration // 0')"
+  [ -n "$user" ] && [ -n "$pass" ] || die "o Vault não devolveu usuário/senha para $vrole"
+  [ "$ttl" -gt 0 ] 2>/dev/null || ttl="$DEFAULT_TTL"
+  fetched="$(now)"
+  kc_set "$KC_DB" "$key" "$pass"
+  cache_write "$key" "$user" "$lease" "$fetched" "$((fetched + ttl))"
+  log "creds vault env=$env svc=$svc role=$role ttl=${ttl}s"
+  echo "$key"
+}
+
+parse_role_flags() {
+  ROLE="reader"; REFRESH=0; POSITIONAL=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --writer|-w) ROLE="writer" ;;
+      --reader|-r) ROLE="reader" ;;
+      --refresh) REFRESH=1 ;;
+      *) POSITIONAL+=("$1") ;;
+    esac
+    shift
+  done
+}
+
+cmd_creds() {
+  require_catalog
+  parse_role_flags "$@"
+  local env="${POSITIONAL[0]:-}" svc="${POSITIONAL[1]:-}"
+  [ -n "$env" ] && [ -n "$svc" ] || die "uso: cadb creds <env> <svc> [--writer] [--refresh]"
+  vault_addr_of "$env" >/dev/null
+  local key; key="$(ensure_creds "$env" "$svc" "$ROLE" "$REFRESH")" || exit 1
+  local fetched expires
+  fetched="$(cache_read "$key" fetched_at)"; expires="$(cache_read "$key" expires_at)"
+  echo "✔ $key — usuário $(cache_read "$key" username) — obtida $(fmt_ts "$fetched"), expira $(fmt_ts "$expires")"
+}
+
+cmd_status() {
+  [ -f "$CACHE" ] && [ "$(jq 'length' "$CACHE")" -gt 0 ] || { echo "(nenhuma credencial em cache)"; return; }
+  local n; n="$(now)"
+  printf '%-48s %-22s %-17s %-17s %s\n' "AMBIENTE/SERVICO/ROLE" "USUARIO" "OBTIDA" "EXPIRA" "RESTANTE"
+  jq -r 'to_entries[] | [.key, .value.username, .value.fetched_at, .value.expires_at] | @tsv' "$CACHE" \
+  | while IFS=$'\t' read -r key user fetched expires; do
+      local left=$((expires - n)) rem
+      if [ "$left" -le 0 ]; then rem="expirada"
+      elif [ "$left" -le "$MARGIN_SECONDS" ]; then rem="renova no próximo uso"
+      else rem="$((left / 3600))h$(printf '%02d' $(((left % 3600) / 60)))m"; fi
+      printf '%-48s %-22s %-17s %-17s %s\n' "$key" "${user:0:22}" "$(fmt_ts "$fetched")" "$(fmt_ts "$expires")" "$rem"
+    done
+}
+
+cmd_list() {
+  require_catalog
+  jq -r 'to_entries[] | .key as $e | (.value.databases // {}) | to_entries[]
+         | [$e, .key, (.value.host // ""), ((.value.port // 5432) | tostring), (.value.dbname // "")] | @tsv' "$CATALOG" \
+  | {
+      printf '%-6s %-32s %s\n' "ENV" "SERVICO" "CONEXAO"
+      while IFS=$'\t' read -r env svc host port db; do
+        case "$host" in ""|"<"*) printf '%-6s %-32s %s\n' "$env" "$svc" "(host não preenchido)" ;;
+          *) printf '%-6s %-32s %s\n' "$env" "$svc" "$host:$port/$db" ;; esac
+      done
+    }
+}
+
+# exporta variáveis PG* para o processo filho
+pg_env() {
+  local env="$1" svc="$2" key="$3"
+  export PGHOST PGPORT PGDATABASE PGUSER PGPASSWORD PGSSLMODE PGCONNECT_TIMEOUT PGAPPNAME
+  PGHOST="$(db_field "$env" "$svc" host)"
+  PGPORT="$(db_field "$env" "$svc" port)"; PGPORT="${PGPORT:-5432}"
+  PGDATABASE="$(db_field "$env" "$svc" dbname)"
+  PGSSLMODE="$(db_field "$env" "$svc" sslmode)"; PGSSLMODE="${PGSSLMODE:-prefer}"
+  PGUSER="$(cache_read "$key" username)"
+  PGPASSWORD="$(kc_get "$KC_DB" "$key")"
+  PGCONNECT_TIMEOUT=10
+  PGAPPNAME="cadb"
+}
+
+is_auth_error() { grep -qiE 'password authentication failed|role .* does not exist' "$1"; }
+
+cmd_query() {
+  require_catalog
+  local env="${1:-}" svc="${2:-}" sql="${3:-}"
+  [ -n "$env" ] && [ -n "$svc" ] && [ -n "$sql" ] || die "uso: cadb query <env> <svc> \"<sql>\""
+  require_db "$env" "$svc"
+
+  # normaliza: tira espaços e ';' finais; recusa múltiplos comandos e escrita
+  sql="$(printf '%s' "$sql" | perl -0777 -pe 's/\s+$//; s/;+\s*$//')"
+  printf '%s' "$sql" | grep -q ';' && die "envie um único comando SQL por vez"
+  if printf '%s' "$sql" | perl -0777 -ne 'exit(/\b(insert|update|delete|merge|upsert|drop|alter|truncate|create|grant|revoke|copy|call|do|vacuum|reindex|cluster|refresh|comment|lock|security\s+label|set\s+role|set\s+session)\b/i ? 0 : 1)'; then
+    die "somente consultas de leitura são permitidas (SELECT/WITH/EXPLAIN/SHOW)"
+  fi
+  printf '%s' "$sql" | perl -0777 -ne 'exit(/^\s*(select|with|explain|show|table|values)\b/i ? 0 : 1)' \
+    || die "a consulta deve começar com SELECT, WITH, EXPLAIN, SHOW, TABLE ou VALUES"
+  local limited=0
+  if printf '%s' "$sql" | perl -0777 -ne 'exit(/^\s*(select|with|table|values)\b/i && !/\blimit\s+\d+/i ? 0 : 1)'; then
+    sql="SELECT * FROM ($sql) AS cadb_q LIMIT $QUERY_ROW_LIMIT"
+    limited=1
+  fi
+
+  local key errf out rc attempt start
+  errf="$(mktemp)"; out="$(mktemp)"
+  start="$(now)"
+  for attempt in 1 2; do
+    key="$(ensure_creds "$env" "$svc" reader "$([ "$attempt" = 2 ] && echo 1 || echo 0)")" || { rm -f "$errf" "$out"; exit 1; }
+    (
+      pg_env "$env" "$svc" "$key"
+      export PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=$STATEMENT_TIMEOUT"
+      psql -X -q -v ON_ERROR_STOP=1 --csv -c "$sql"
+    ) >"$out" 2>"$errf"
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ "$attempt" = 1 ] && is_auth_error "$errf"; then
+      info "credencial recusada pelo banco; renovando no Vault…"
+      continue
+    fi
+    break
+  done
+
+  local rows=0
+  [ -s "$out" ] && rows=$(( $(wc -l <"$out") - 1 ))
+  log "query env=$env svc=$svc rc=$rc rows=$rows dur=$(( $(now) - start ))s"
+  if [ "$rc" -ne 0 ]; then
+    cat "$errf" >&2; rm -f "$errf" "$out"; exit "$rc"
+  fi
+  cat "$out"
+  [ "$limited" = 1 ] && [ "$rows" -ge "$QUERY_ROW_LIMIT" ] && info "(resultado limitado a $QUERY_ROW_LIMIT linhas — use LIMIT explícito para outro valor)"
+  rm -f "$errf" "$out"
+}
+
+cmd_psql() {
+  require_catalog
+  parse_role_flags "$@"
+  local env="${POSITIONAL[0]:-}" svc="${POSITIONAL[1]:-}"
+  [ -n "$env" ] && [ -n "$svc" ] || die "uso: cadb psql <env> <svc> [--writer]"
+  require_db "$env" "$svc"
+  [ -t 0 ] || die "cadb psql é só para uso interativo (use cadb query)"
+  local key; key="$(ensure_creds "$env" "$svc" "$ROLE" "$REFRESH")" || exit 1
+  if [ "$ROLE" = "writer" ]; then
+    printf '⚠️  sessão de ESCRITA em %s/%s. Digite o nome do serviço para confirmar: ' "$env" "$svc" >&2
+    local answer; read -r answer
+    [ "$answer" = "$svc" ] || die "confirmação não confere — cancelado"
+  fi
+  log "psql env=$env svc=$svc role=$ROLE"
+  pg_env "$env" "$svc" "$key"
+  exec psql -X
+}
+
+cmd_forget() {
+  local keys
+  if [ "${1:-}" = "--all" ]; then
+    [ -f "$CACHE" ] || { echo "(nada em cache)"; return; }
+    keys="$(jq -r 'keys[]' "$CACHE")"
+  else
+    local env="${1:-}" svc="${2:-}"
+    [ -n "$env" ] && [ -n "$svc" ] || die "uso: cadb forget <env> <svc> | --all"
+    keys="$env/$svc/reader
+$env/$svc/writer"
+  fi
+  local key env lease addr token
+  for key in $keys; do
+    lease="$(cache_read "$key" lease_id)"
+    env="${key%%/*}"
+    if [ -n "$lease" ] && [ -f "$CATALOG" ]; then
+      addr="$(jq -r --arg e "$env" '.[$e].vault_addr // empty' "$CATALOG")"
+      if [ -n "$addr" ] && token="$(vault_token_for "$env" 2>/dev/null)"; then
+        VAULT_ADDR="$addr" VAULT_TOKEN="$token" vault lease revoke "$lease" >/dev/null 2>&1 \
+          && info "lease revogado: $key"
+      fi
+    fi
+    kc_del "$KC_DB" "$key"
+    cache_delete "$key"
+  done
+  log "forget ${1:-} ${2:-}"
+  echo "✔ credenciais removidas"
+}
+
+cmd_init() {
+  [ -f "$CATALOG" ] && die "$CATALOG já existe"
+  [ -f "$EXAMPLE" ] || die "exemplo não encontrado: $EXAMPLE"
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  cp "$EXAMPLE" "$CATALOG"; chmod 600 "$CATALOG"
+  echo "✔ criado $CATALOG — preencha host/port/dbname de cada serviço"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init)    cmd_init "$@" ;;
+  list|ls) cmd_list "$@" ;;
+  login)   cmd_login "$@" ;;
+  creds)   cmd_creds "$@" ;;
+  status)  cmd_status "$@" ;;
+  query)   cmd_query "$@" ;;
+  psql)    cmd_psql "$@" ;;
+  forget)  cmd_forget "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

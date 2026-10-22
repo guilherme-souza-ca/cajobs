@@ -3,3 +3,5 @@ logs/
 .locks/
 .claude/settings.local.json
 .DS_Store
+config/databases.json
+*.local.json
