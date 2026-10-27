@@ -1,0 +1,6 @@
+{
+  "description": "Baseline do legado (inventory) da tabela de preço: p95, requisições e 5xx por EP antes do Canary",
+  "prompt": "/baseline-price-tables",
+  "model": "sonnet",
+  "timeout_minutes": 20
+}

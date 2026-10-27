@@ -1,9 +1,9 @@
 ---
-description: Lista os erros (HTTP 5xx + status:error) do order-to-cash-commercial — últimas 24h por padrão, ou um período com --de/--ate (via agent datadog-5xx-order-to-cash-commercial)
+description: Lista os erros (HTTP 5xx + status:error) do order-to-cash-commercial e a p95/5xx dos endpoints /price-tables — últimas 24h por padrão, ou um período com --de/--ate (via agent datadog-5xx-order-to-cash-commercial)
 argument-hint: "[env] [--de AAAA-MM-DD] [--ate AAAA-MM-DD]"
 ---
 
-Use o subagent `datadog-5xx-order-to-cash-commercial` para verificar e listar todos os erros (HTTP 5xx e `status:error` sem 5xx) do serviço `order-to-cash-commercial` no Datadog.
+Use o subagent `datadog-5xx-order-to-cash-commercial` para verificar e listar todos os erros (HTTP 5xx e `status:error` sem 5xx) do serviço `order-to-cash-commercial` no Datadog, incluindo a seção de latência (p95) e 5xx dos endpoints `/price-tables`.
 
 Argumentos recebidos: `$ARGUMENTS` → `[env] [--de AAAA-MM-DD] [--ate AAAA-MM-DD]`, em qualquer ordem.
 

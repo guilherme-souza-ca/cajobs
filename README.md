@@ -15,7 +15,8 @@ Projeto local para **orquestrar agents e automações do Claude Code** nesta má
 
 ## Funcionalidades
 
-- **Agent de erros do `order-to-cash-commercial`** — verifica no Datadog APM as respostas HTTP 5xx **e** as spans com `status:error` que não viraram 5xx (exceções tratadas, banco, chamadas a outros serviços), agrupa por endpoint/operação e tipo de erro e analisa a causa provável nos traces. Somente leitura.
+- **Agent de erros do `order-to-cash-commercial`** — verifica no Datadog APM as respostas HTTP 5xx **e** as spans com `status:error` que não viraram 5xx (exceções tratadas, banco, chamadas a outros serviços), agrupa por endpoint/operação e tipo de erro e analisa a causa provável nos traces. Traz também a **p95 e a taxa de 5xx dos endpoints `/price-tables`** (EP-01…EP-08), com criar/editar separados por quantidade de itens. Somente leitura.
+- **Baseline do legado da tabela de preço** — p95 (mediana das p95 diárias, métrica sem amostragem), requisições e 5xx do serviço `inventory` por EP equivalente, num período anterior ao Canary; `batch-add-items` por quantidade de itens.
 - **Publicação no Slack** — skill reutilizável que envia qualquer relatório de `reports/` para qualquer canal/DM: só o **título** no canal e o **conteúdo na thread**, para não poluir o canal.
 - **CLI `cajobs`** — cadastra, executa, agenda (launchd) e acompanha automações; também roda qualquer slash command do projeto pelo terminal.
 - **Relatórios e histórico** — cada execução gera um `.md` datado com status no cabeçalho; histórico consolidado em `logs/history.tsv`.
@@ -49,12 +50,15 @@ agents/
 ├── bin/cadb                            # acesso a bancos via Vault com cache de credenciais
 ├── config/databases.example.json       # modelo do catálogo de hosts
 ├── automations/                        # definições das automações (JSON)
-│   └── erros-5xx-otc.json
+│   ├── erros-5xx-otc.json
+│   └── baseline-price-tables.json
 ├── .claude/
 │   ├── agents/                         # subagents
-│   │   └── datadog-5xx-order-to-cash-commercial.md
+│   │   ├── datadog-5xx-order-to-cash-commercial.md
+│   │   └── datadog-baseline-price-tables.md
 │   ├── commands/                       # slash commands (prompts prontos)
 │   │   ├── erros-5xx.md
+│   │   ├── baseline-price-tables.md
 │   │   └── enviar-5xx-slack.md
 │   ├── skills/
 │   │   ├── enviar-report-slack/SKILL.md
@@ -99,7 +103,8 @@ Abra uma sessão nesta pasta (`cd ~/repos/local/agents && claude`) e use:
 
 | Comando | O que faz |
 |---|---|
-| `/erros-5xx [env]` | lista 5xx + `status:error` do `order-to-cash-commercial` nas últimas 24h |
+| `/erros-5xx [env]` | lista 5xx + `status:error` do `order-to-cash-commercial` nas últimas 24h, com p95/5xx dos endpoints `/price-tables` |
+| `/baseline-price-tables [--de AAAA-MM-DD] [--ate AAAA-MM-DD]` | baseline do legado (`inventory`) da tabela de preço por EP — default 15/09 → 14/10/2026 |
 | `/enviar-5xx-slack [--preview]` | envia o último relatório do `erros-5xx-otc` para `#o2c-commercial-reports` |
 | `/enviar-report-slack <relatório> <canal> [--titulo "…{data}"] [--preview]` | envia qualquer relatório para qualquer canal/DM |
 
@@ -133,11 +138,12 @@ Cada automação é um JSON em `automations/`:
 | `schedule` | não | `hour`, `minute`, `weekdays` (0/7=dom, 1=seg … 6=sab; omitido = todo dia). Sem `schedule` = só manual |
 | `after` | não | slash commands executados depois que o relatório é gravado (inclusive em falha) |
 
-### Automação ativa
+### Automações
 
 | Automação | Agenda | O que faz |
 |---|---|---|
-| `erros-5xx-otc` | seg–sex 10:00 | checa erros do `order-to-cash-commercial` em `production` e publica em `#o2c-commercial-reports` com o título `Report Diário De Error De Commercial - DD/MM/AAAA` |
+| `baseline-price-tables` | manual | baseline do legado da tabela de preço (`cajobs run baseline-price-tables`) |
+| `erros-5xx-otc` | seg–sex 10:00 | checa erros e p95/5xx de `/price-tables` do `order-to-cash-commercial` em `production` e publica em `#o2c-commercial-reports` com o título `Report Diário De Error De Commercial - DD/MM/AAAA` |
 
 ### Criando uma nova automação
 

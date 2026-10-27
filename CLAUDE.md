@@ -7,13 +7,14 @@ Projeto local de agents do Claude Code para automações de observabilidade (Dat
 - `.claude/agents/*.md` — subagents do projeto (carregados ao abrir o Claude Code neste diretório).
 - `.claude/commands/*.md` — prompts prontos (slash commands) que disparam os agents. Ex.: `/erros-5xx [env]`, `/enviar-5xx-slack [--preview]` (último report do `erros-5xx-otc` → `#o2c-commercial-reports`).
 - `.claude/skills/*/SKILL.md` — skills do projeto. Ex.: `/enviar-report-slack <relatório> <canal> [--preview]`.
-- `.claude/settings.json` — permissões pré-aprovadas: ferramentas **de leitura** do MCP `claude.ai Datadog` + busca de canais e envio de mensagem do `claude.ai Slack` (usado pela skill `enviar-report-slack`).
+- `.claude/settings.json` — permissões pré-aprovadas: ferramentas **de leitura** do MCP `claude.ai Datadog` (spans, traces e `get_datadog_metric`) + busca de canais e envio de mensagem do `claude.ai Slack` (usado pela skill `enviar-report-slack`).
 
 ## Agents
 
 | Agent | O que faz |
 |---|---|
-| `datadog-5xx-order-to-cash-commercial` | Verifica e lista erros do serviço `order-to-cash-commercial` (APM): HTTP 5xx + spans `status:error` sem 5xx, agrupados por endpoint/operação e tipo de erro. |
+| `datadog-5xx-order-to-cash-commercial` | Verifica e lista erros do serviço `order-to-cash-commercial` (APM): HTTP 5xx + spans `status:error` sem 5xx, agrupados por endpoint/operação e tipo de erro; mais p95/5xx dos endpoints `/price-tables` (EP-01…EP-08), com POST/PUT por quantidade de itens. |
+| `datadog-baseline-price-tables` | Baseline do legado (`inventory`) da tabela de preço por EP: requisições, p95 (mediana das p95 diárias, métrica sem amostragem) e 5xx antes do Canary; `batch-add-items` por quantidade de itens. Comando `/baseline-price-tables [--de] [--ate]`, automação manual `baseline-price-tables`. |
 
 ## Skills
 

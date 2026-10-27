@@ -1,9 +1,19 @@
 {
-  "description": "5xx + status:error do order-to-cash-commercial nas últimas 24h (production)",
+  "description": "5xx + status:error do order-to-cash-commercial e p95/5xx de /price-tables nas últimas 24h (production)",
   "prompt": "/erros-5xx production",
   "model": "sonnet",
   "timeout_minutes": 15,
-  "schedule": { "hour": 10, "minute": 0, "weekdays": [1, 2, 3, 4, 5] },
+  "schedule": {
+    "hour": 10,
+    "minute": 0,
+    "weekdays": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
   "after": [
     "enviar-5xx-slack"
   ]
